@@ -1188,9 +1188,8 @@ public class VirtualRouter implements Serializable {
       // Setup helper vars
       BgpPeerConfigId remoteConfigId = e.getKey().tail();
       BgpPeerConfigId ourConfigId = e.getKey().head();
-      BgpSessionProperties sessionProperties =
-          getBgpSessionProperties(bgpTopology, new EdgeId(remoteConfigId, ourConfigId));
-      BgpPeerConfig ourBgpConfig = requireNonNull(nc.getBgpPeerConfig(e.getKey().head()));
+      BgpSessionProperties sessionProperties = getBgpSessionProperties(bgpTopology, e.getKey());
+      BgpPeerConfig ourBgpConfig = requireNonNull(nc.getBgpPeerConfig(ourConfigId));
       assert ourBgpConfig.getIpv4UnicastAddressFamily() != null;
       // sessionProperties represents the incoming edge, so its tailIp is the remote peer's IP
       boolean useRibGroups =
@@ -1201,34 +1200,17 @@ public class VirtualRouter implements Serializable {
           sessionProperties.isEbgp()
               ? _bgpRoutingProcess._ebgpv4StagingRib
               : _bgpRoutingProcess._ibgpv4StagingRib;
+      Builder<Bgpv4Route> ribDelta = ribDeltas.get(targetRib);
       Builder<AnnotatedRoute<AbstractRoute>> perNeighborDeltaForRibGroups = RibDelta.builder();
 
       // TODO: ensure there is always an import policy
       @Nullable
       String importPolicyName = ourBgpConfig.getIpv4UnicastAddressFamily().getImportPolicy();
-      @Nullable
-      RoutingPolicy importPolicy =
-          importPolicyName == null
-              ? null
-              : Optional.ofNullable(_c.getRoutingPolicies().get(importPolicyName)).orElse(null);
 
       // Process all routes from neighbor
       while (queue.peek() != null) {
         RouteAdvertisement<Bgpv4Route> remoteRouteAdvert = queue.remove();
-        Bgpv4Route transformedIncomingRoute =
-            processIncomingRoute(
-                remoteRouteAdvert.getRoute(),
-                ourBgpConfig
-                    .getIpv4UnicastAddressFamily()
-                    .getAddressFamilyCapabilities()
-                    .getAllowLocalAsIn(),
-                sessionProperties,
-                importPolicy,
-                ourConfigId,
-                remoteConfigId);
-        if (transformedIncomingRoute == null) {
-          continue;
-        }
+        Bgpv4Route transformedIncomingRoute = remoteRouteAdvert.getRoute();
 
         // If new route gets leaked to other VRFs via RibGroup, this VRF should be its source
         AnnotatedRoute<AbstractRoute> annotatedTransformedRoute =
@@ -1236,13 +1218,13 @@ public class VirtualRouter implements Serializable {
 
         if (remoteRouteAdvert.isWithdrawn()) {
           // Note this route was removed
-          ribDeltas.get(targetRib).remove(transformedIncomingRoute, Reason.WITHDRAW);
+          ribDelta.remove(transformedIncomingRoute, Reason.WITHDRAW);
           if (useRibGroups) {
             perNeighborDeltaForRibGroups.remove(annotatedTransformedRoute, Reason.WITHDRAW);
           }
         } else {
           // Merge into staging rib, note delta
-          ribDeltas.get(targetRib).from(targetRib.mergeRouteGetDelta(transformedIncomingRoute));
+          ribDelta.from(targetRib.mergeRouteGetDelta(transformedIncomingRoute));
           if (useRibGroups) {
             perNeighborDeltaForRibGroups.add(annotatedTransformedRoute);
           }
@@ -1554,7 +1536,9 @@ public class VirtualRouter implements Serializable {
             mainRibExports);
 
     // Call this on the REMOTE VR and REVERSE the edge!
-    remoteVirtualRouter.enqueueBgpMessages(edge.reverse(), exportedAdvertisements);
+    EdgeId reverseEdge = edge.reverse();
+    remoteVirtualRouter.enqueueBgpMessages(
+        reverseEdge, getBgpSessionProperties(bgpTopology, reverseEdge), exportedAdvertisements);
   }
 
   private static BgpSessionProperties getBgpSessionProperties(
@@ -1840,7 +1824,11 @@ public class VirtualRouter implements Serializable {
             .collect(ImmutableSet.toImmutableSet());
 
     // Call this on the neighbor's VR, and reverse the edge!
-    remoteVr.enqueueBgpMessages(edge.reverse(), exportedNeighborSpecificRoutes);
+    EdgeId reverseEdge = edge.reverse();
+    remoteVr.enqueueBgpMessages(
+        reverseEdge,
+        getBgpSessionProperties(topology, reverseEdge),
+        exportedNeighborSpecificRoutes);
   }
 
   /**
@@ -2159,14 +2147,55 @@ public class VirtualRouter implements Serializable {
 
   /** Temporary wrapper for {@link BgpRoutingProcess#enqueueBgpv4Routes(EdgeId, Collection)} */
   private void enqueueBgpMessages(
-      @Nonnull EdgeId edgeId, @Nonnull Collection<RouteAdvertisement<Bgpv4Route>> routes) {
-    _bgpRoutingProcess.enqueueBgpv4Routes(edgeId, routes);
+      @Nonnull EdgeId edgeId,
+      BgpSessionProperties sessionProperties,
+      @Nonnull Collection<RouteAdvertisement<Bgpv4Route>> routes) {
+    enqueueBgpMessages(edgeId, sessionProperties, routes.stream());
   }
 
   /** Temporary wrapper for {@link BgpRoutingProcess#enqueueBgpMessages(EdgeId, Stream)} */
   private void enqueueBgpMessages(
-      @Nonnull EdgeId edgeId, @Nonnull Stream<RouteAdvertisement<Bgpv4Route>> routes) {
-    _bgpRoutingProcess.enqueueBgpMessages(edgeId, routes);
+      @Nonnull EdgeId edgeId,
+      BgpSessionProperties sessionProperties,
+      @Nonnull Stream<RouteAdvertisement<Bgpv4Route>> routes) {
+    BgpPeerConfigId ourConfigId = edgeId.head();
+    BgpPeerConfigId remoteConfigId = edgeId.tail();
+
+    NetworkConfigurations nc = NetworkConfigurations.of(ImmutableMap.of(_c.getHostname(), _c));
+    BgpPeerConfig ourBgpConfig = requireNonNull(nc.getBgpPeerConfig(ourConfigId));
+
+    boolean allowLocalAsIn =
+        ourBgpConfig
+            .getIpv4UnicastAddressFamily()
+            .getAddressFamilyCapabilities()
+            .getAllowLocalAsIn();
+
+    // TODO: ensure there is always an import policy
+    @Nullable
+    String importPolicyName = ourBgpConfig.getIpv4UnicastAddressFamily().getImportPolicy();
+    @Nullable
+    RoutingPolicy importPolicy =
+        importPolicyName == null
+            ? null
+            : Optional.ofNullable(_c.getRoutingPolicies().get(importPolicyName)).orElse(null);
+
+    Stream<RouteAdvertisement<Bgpv4Route>> transformedIncomingRoutes =
+        routes.flatMap(
+            adv -> {
+              Bgpv4Route incomingRoute =
+                  processIncomingRoute(
+                      adv.getRoute(),
+                      allowLocalAsIn,
+                      sessionProperties,
+                      importPolicy,
+                      ourConfigId,
+                      remoteConfigId);
+              if (incomingRoute == null) {
+                return Stream.of();
+              }
+              return Stream.of(adv.toBuilder().setRoute(incomingRoute).build());
+            });
+    _bgpRoutingProcess.enqueueBgpMessages(edgeId, transformedIncomingRoutes);
   }
 
   /** Return all EVPN routes in this VRF */
