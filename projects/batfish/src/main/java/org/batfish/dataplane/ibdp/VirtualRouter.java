@@ -1109,6 +1109,55 @@ public class VirtualRouter implements Serializable {
     }
   }
 
+  private Bgpv4Route processIncomingRoute(
+      Bgpv4Route remoteRoute,
+      boolean allowLocalAsIn,
+      BgpSessionProperties sessionProperties,
+      @Nullable RoutingPolicy importPolicy,
+      BgpPeerConfigId ourConfigId,
+      BgpPeerConfigId remoteConfigId) {
+    Bgpv4Route.Builder transformedIncomingRouteBuilder =
+        transformBgpRouteOnImport(
+            remoteRoute,
+            sessionProperties.getHeadAs(),
+            allowLocalAsIn,
+            sessionProperties.isEbgp(),
+            _bgpRoutingProcess._process,
+            ourConfigId.getPeerInterface());
+    if (transformedIncomingRouteBuilder == null) {
+      // Route could not be imported for core protocol reasons
+      _prefixTracer.filtered(
+          remoteRoute.getNetwork(),
+          remoteConfigId.getHostname(),
+          sessionProperties.getTailIp(),
+          remoteConfigId.getVrfName(),
+          null,
+          IN);
+      return null;
+    }
+
+    // Process route through import policy, if one exists
+    if (importPolicy == null) {
+      return transformedIncomingRouteBuilder.build();
+    }
+
+    boolean acceptIncoming =
+        importPolicy.processBgpRoute(
+            remoteRoute, transformedIncomingRouteBuilder, sessionProperties, IN);
+    if (!acceptIncoming) {
+      // Route could not be imported due to routing policy
+      _prefixTracer.filtered(
+          remoteRoute.getNetwork(),
+          remoteConfigId.getHostname(),
+          sessionProperties.getTailIp(),
+          remoteConfigId.getVrfName(),
+          importPolicy.getName(),
+          IN);
+      return null;
+    }
+    return transformedIncomingRouteBuilder.build();
+  }
+
   /**
    * Process BGP messages from neighbors, return a list of delta changes to the RIBs
    *
@@ -1147,7 +1196,6 @@ public class VirtualRouter implements Serializable {
       boolean useRibGroups =
           ourBgpConfig.getAppliedRibGroup() != null
               && !ourBgpConfig.getAppliedRibGroup().getImportRibs().isEmpty();
-      Ip remoteIp = sessionProperties.getTailIp();
 
       Bgpv4Rib targetRib =
           sessionProperties.isEbgp()
@@ -1155,58 +1203,32 @@ public class VirtualRouter implements Serializable {
               : _bgpRoutingProcess._ibgpv4StagingRib;
       Builder<AnnotatedRoute<AbstractRoute>> perNeighborDeltaForRibGroups = RibDelta.builder();
 
+      // TODO: ensure there is always an import policy
+      @Nullable
+      String importPolicyName = ourBgpConfig.getIpv4UnicastAddressFamily().getImportPolicy();
+      @Nullable
+      RoutingPolicy importPolicy =
+          importPolicyName == null
+              ? null
+              : Optional.ofNullable(_c.getRoutingPolicies().get(importPolicyName)).orElse(null);
+
       // Process all routes from neighbor
       while (queue.peek() != null) {
         RouteAdvertisement<Bgpv4Route> remoteRouteAdvert = queue.remove();
-        Bgpv4Route remoteRoute = remoteRouteAdvert.getRoute();
-
-        Bgpv4Route.Builder transformedIncomingRouteBuilder =
-            transformBgpRouteOnImport(
-                remoteRoute,
-                sessionProperties.getHeadAs(),
+        Bgpv4Route transformedIncomingRoute =
+            processIncomingRoute(
+                remoteRouteAdvert.getRoute(),
                 ourBgpConfig
                     .getIpv4UnicastAddressFamily()
                     .getAddressFamilyCapabilities()
                     .getAllowLocalAsIn(),
-                sessionProperties.isEbgp(),
-                _bgpRoutingProcess._process,
-                ourConfigId.getPeerInterface());
-        if (transformedIncomingRouteBuilder == null) {
-          // Route could not be imported for core protocol reasons
-          _prefixTracer.filtered(
-              remoteRoute.getNetwork(),
-              remoteConfigId.getHostname(),
-              remoteIp,
-              remoteConfigId.getVrfName(),
-              null,
-              IN);
+                sessionProperties,
+                importPolicy,
+                ourConfigId,
+                remoteConfigId);
+        if (transformedIncomingRoute == null) {
           continue;
         }
-
-        // Process route through import policy, if one exists
-        String importPolicyName = ourBgpConfig.getIpv4UnicastAddressFamily().getImportPolicy();
-        boolean acceptIncoming = true;
-        // TODO: ensure there is always an import policy
-        if (importPolicyName != null) {
-          RoutingPolicy importPolicy = _c.getRoutingPolicies().get(importPolicyName);
-          if (importPolicy != null) {
-            acceptIncoming =
-                importPolicy.processBgpRoute(
-                    remoteRoute, transformedIncomingRouteBuilder, sessionProperties, IN);
-          }
-        }
-        if (!acceptIncoming) {
-          // Route could not be imported due to routing policy
-          _prefixTracer.filtered(
-              remoteRoute.getNetwork(),
-              remoteConfigId.getHostname(),
-              remoteIp,
-              remoteConfigId.getVrfName(),
-              importPolicyName,
-              IN);
-          continue;
-        }
-        Bgpv4Route transformedIncomingRoute = transformedIncomingRouteBuilder.build();
 
         // If new route gets leaked to other VRFs via RibGroup, this VRF should be its source
         AnnotatedRoute<AbstractRoute> annotatedTransformedRoute =
@@ -1227,7 +1249,7 @@ public class VirtualRouter implements Serializable {
           _prefixTracer.installed(
               transformedIncomingRoute.getNetwork(),
               remoteConfigId.getHostname(),
-              remoteIp,
+              sessionProperties.getTailIp(),
               remoteConfigId.getVrfName(),
               importPolicyName);
         }
