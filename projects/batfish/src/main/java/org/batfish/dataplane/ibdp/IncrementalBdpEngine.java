@@ -18,6 +18,7 @@ import com.google.common.collect.Sets;
 import io.opentracing.Scope;
 import io.opentracing.Span;
 import io.opentracing.util.GlobalTracer;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Map.Entry;
@@ -27,6 +28,7 @@ import java.util.SortedMap;
 import java.util.SortedSet;
 import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Stream;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.batfish.common.BatfishLogger;
@@ -764,6 +766,19 @@ class IncrementalBdpEngine {
         _numIterations++;
         Span iterSpan = GlobalTracer.get().buildSpan("Iteration " + _numIterations).start();
         LOGGER.info("Iteration {} begins", _numIterations);
+
+        // log total size of all bgp queues
+        int totalQueueSize =
+            nodes.values().stream()
+                .flatMap(node -> node.getVirtualRouters().values().stream())
+                .flatMap(
+                    vr ->
+                        vr._bgpRoutingProcess == null
+                            ? Stream.of()
+                            : vr._bgpRoutingProcess._bgpv4IncomingRoutes.values().stream())
+                .mapToInt(Collection::size)
+                .sum();
+        LOGGER.info("Enqueued BGP4 incoming routes: {}", totalQueueSize);
         try (Scope innerScope = GlobalTracer.get().scopeManager().activate(iterSpan)) {
           assert innerScope != null; // avoid unused warning
 
